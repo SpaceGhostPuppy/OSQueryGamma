@@ -1,65 +1,201 @@
-# Installieren unter macOS
+# OSQuery + FleetDM Deployment Guide for macOS
 
-Continuous Integration testet derzeit macOS Builds von osquery gegen macOS 11 (siehe die os: [macos- Zeile in der build_macos Sektion der CI-Konfiguration. Die gesamte Kernfunktionalität von osquery sollte auf macOS 10.15 oder neuer funktionieren, obwohl einige Tabellen Daten lesen können, die nur auf bestimmten Versionen von macOS vorhanden sind, da Apple neue Datenquellen hinzufügt oder andere veraltet sind. Versionen von macOS 10.14 und älter werden nicht mehr unterstützt.
+## 1. FleetDM Server Setup
 
-# Paket-Installation
+### Prerequisites
+- A Linux server (Ubuntu 20.04+ recommended)
+- Docker and Docker Compose
+- Valid domain name with SSL certificate
+- Minimum 4GB RAM, 2 CPU cores
 
-Wenn Sie einen unternehmensweiten Einsatz von osquery planen, ist die einfachste Installationsmethode ein macOS-Paketinstallationsprogramm. Sie müssen Updates verwalten und verteilen.
+### Server Installation
 
-Jeder osquery-Tag (Release) erstellt ein macOS-Paket: osquery.io/downloads. Es gibt keine Abhängigkeiten von Paketen oder Bibliotheken.
+```bash
+# Install Docker and Docker Compose if not already installed
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
 
-Das Standardpaket erstellt die folgende Struktur:
+# Create Fleet directory
+mkdir ~/fleet && cd ~/fleet
 
-/private/var/osquery/io.osquery.agent.plist
-/private/var/osquery/osquery.example.conf
-/private/var/log/osquery/
-/private/var/osquery/lenses/{*}.aug
-/private/var/osquery/packs/{*}.conf
-/opt/osquery/lib/osquery.app
-/usr/local/bin/osqueryi -> /opt/osquery/lib/osquery.app/Contents/MacOS/osqueryd
-/usr/local/bin/osqueryctl -> /opt/osquery/lib/osquery.app/Contents/Resources/osqueryctl
+# Create Docker Compose configuration
+cat << 'EOF' > docker-compose.yml
+version: '3'
+services:
+  mysql:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: your_secure_password
+      MYSQL_DATABASE: fleet
+      MYSQL_USER: fleet
+      MYSQL_PASSWORD: fleet_secure_password
+    volumes:
+      - mysql-data:/var/lib/mysql
 
-Dieses Paket installiert keinen LaunchDaemon zum Starten von osqueryd. Sie können das Skript osqueryctl start verwenden, um die Beispiel-LaunchDaemon-Job-Pliste und die zugehörige Konfiguration zu kopieren.
+  fleet:
+    image: fleetdm/fleet:latest
+    ports:
+      - "8080:8080"
+    environment:
+      FLEET_MYSQL_ADDRESS: mysql:3306
+      FLEET_MYSQL_DATABASE: fleet
+      FLEET_MYSQL_USERNAME: fleet
+      FLEET_MYSQL_PASSWORD: fleet_secure_password
+      FLEET_SERVER_ADDRESS: https://your.domain.com:8080
+      FLEET_AUTH_JWT_KEY: random_secure_string_here
+    depends_on:
+      - mysql
+    restart: always
 
+volumes:
+  mysql-data:
+EOF
 
-# Hinweis zum Upgrade von osquery 4.x auf 5.x
+# Start Fleet
+docker-compose up -d
+```
 
-Beim Upgrade von älteren Versionen auf neuere bietet osquery selbst keinen Mechanismus, um den Dienst der älteren Version zu stoppen, osquery zu aktualisieren und dann den Dienst neu zu starten.
+### Initial Fleet Configuration
 
-# Schritte nach der Installation
+1. Access the Fleet UI at `https://your.domain.com:8080`
+2. Create the initial admin account
+3. Generate an enrollment secret from Settings → Enroll Secret
 
-Diese Schritte gelten nur, wenn dies das erste Mal ist, dass Sie osqueryd auf diesem Mac installieren und ausführen.
+## 2. OSQuery Installation on macOS Clients
 
-Führen Sie nach Abschluss der Paketinstallation die folgenden Befehle aus. Wenn Sie das Rezept zur Installation von osquery verwenden, sind diese Schritte nicht notwendig: Das Rezept deckt dies ab. https://osquery.readthedocs.io/en/latest/deployment/configuration/#chef-macos
+### Install OSQuery
 
-_You can use the helper script:_
-sudo osqueryctl start
+```bash
+# Install using Homebrew
+brew install osquery
 
-_Or, install the example config and launch daemon yourself:_
-sudo cp /var/osquery/osquery.example.conf /var/osquery/osquery.conf
-sudo cp /var/osquery/io.osquery.agent.plist /Library/LaunchDaemons
-sudo launchctl load /Library/LaunchDaemons/io.osquery.agent.plist
+# Or download the package from osquery.io
+# https://osquery.io/downloads/official/
+```
 
-# Entfernen von osquery
+### Install Fleet Launcher
 
-Um osquery von einem macOS-System zu entfernen, führen Sie die folgenden Befehle aus:
+```bash
+# Download Fleet Launcher
+curl -O https://github.com/fleetdm/fleet/releases/latest/download/fleet-launcher-darwin.pkg
 
-_Unload and remove io.osquery.agent.plist launchdaemon_
-sudo launchctl unload /Library/LaunchDaemons/io.osquery.agent.plist
-sudo rm /Library/LaunchDaemons/io.osquery.agent.plist
+# Install Fleet Launcher
+sudo installer -pkg fleet-launcher-darwin.pkg -target /
+```
 
-_Remove files/directories created by osquery installer pkg_
-sudo rm -rf /private/var/log/osquery
-sudo rm -rf /private/var/osquery
-sudo rm /usr/local/bin/osquery*
-sudo rm -rf /opt/osquery
+### Configure Fleet Launcher
 
-sudo pkgutil --forget io.osquery.agent
+```bash
+# Create configuration directory
+sudo mkdir -p /etc/fleet
 
+# Create launcher configuration
+sudo cat << EOF > /etc/fleet/config
+{
+  "server": "https://your.domain.com:8080",
+  "enroll_secret": "your_enrollment_secret_here",
+  "root_directory": "/var/fleet",
+  "logging_directory": "/var/log/fleet"
+}
+EOF
 
-Um eine eigenständige osquery zu starten, verwenden Sie: osqueryi. Dies benötigt keinen Server oder Dienst. Alle Tabellenimplementierungen sind enthalten!
+# Start Fleet Launcher service
+sudo launchctl load /Library/LaunchDaemons/com.fleetdm.fleet-launcher.plist
+```
 
-Nachdem Sie den Rest der Dokumentation durchgelesen haben, sollten Sie die Grundlagen der Konfiguration und der Protokollierung verstehen. Diese und die meisten anderen Konzepte gelten für osqueryd, den Daemon.
+## 3. Vulnerability Scanning Configuration
 
+### Create Basic Queries in Fleet
 
+Navigate to Queries → New Query and add these essential security queries:
 
+```sql
+-- Check for SIP Status
+SELECT * FROM sip_config;
+
+-- List all installed applications
+SELECT name, path, bundle_version
+FROM apps;
+
+-- Check for FileVault status
+SELECT * FROM disk_encryption;
+
+-- Monitor SSH config
+SELECT * FROM ssh_configs;
+
+-- Check running processes
+SELECT name, path, pid 
+FROM processes 
+WHERE on_disk = 0;
+```
+
+### Schedule Automated Scans
+
+1. Create a new query pack in Fleet:
+   - Navigate to Packs → New Pack
+   - Name it "MacOS Security Scanning"
+   - Add your queries with appropriate intervals
+
+2. Configure automated query intervals:
+   - Critical security checks: 1 hour
+   - System inventory: 24 hours
+   - Configuration checks: 6 hours
+
+### Set Up Alerts
+
+1. Configure alert rules in Fleet:
+   - Navigate to Alerts → New Alert
+   - Set conditions for critical findings
+   - Configure notification channels (email, Slack, etc.)
+
+2. Example alert conditions:
+   - SIP disabled
+   - FileVault disabled
+   - Unauthorized SSH configurations
+   - Unknown processes running
+
+## 4. Best Practices
+
+1. **Performance Optimization**
+   - Stagger query execution times
+   - Set appropriate intervals based on criticality
+   - Monitor system resource usage
+
+2. **Security Considerations**
+   - Regularly rotate enrollment secrets
+   - Use TLS for all communications
+   - Implement least privilege access
+   - Regular backup of Fleet configuration
+
+3. **Maintenance**
+   - Regular updates for OSQuery and Fleet
+   - Monitor logs for errors
+   - Regular review of query performance
+   - Backup of configuration and data
+
+## 5. Troubleshooting
+
+### Common Issues and Solutions
+
+1. Connection Issues:
+```bash
+# Check Fleet Launcher status
+sudo launchctl list | grep fleet
+
+# View logs
+sudo tail -f /var/log/fleet/launcher.log
+```
+
+2. Query Failures:
+```bash
+# Check OSQuery status
+sudo osqueryi --verbose
+```
+
+3. Performance Issues:
+```bash
+# Monitor resource usage
+sudo osqueryi "SELECT * FROM processes WHERE name LIKE '%osquery%';"
+```
